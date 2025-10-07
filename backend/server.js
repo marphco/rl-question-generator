@@ -14,16 +14,18 @@ dotenv.config({ path: path.join(__dirname, ".env") });
 
 const app = express();
 
-const allowed = new Set([
-  "http://localhost:5173",
-  "https://rl-question-generator.vercel.app",
-]);
+// const allowed = new Set([
+//   "http://localhost:5173",
+//   "https://rl-question-generator.vercel.app",
+// ]);
 
 app.use(cors({
-  origin: (origin, cb) => {
-    if (!origin || allowed.has(origin)) return cb(null, true);
-    return cb(new Error("CORS blocked"));
-  },
+  origin: [
+    "http://localhost:5173",
+    "https://rl-question-generator.vercel.app",
+    "https://basicadv.com",
+    "https://www.basicadv.com"
+  ],
   methods: ["GET","POST","PUT","DELETE","OPTIONS"],
   allowedHeaders: ["Content-Type","Authorization"],
 }));
@@ -126,6 +128,7 @@ app.post("/api/generate-questions", async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => {
+app.get("/api/health", (_req, res) => res.json({ ok: true }));
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`Server avviato su http://0.0.0.0:${PORT}`);
 });
