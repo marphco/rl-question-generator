@@ -74,29 +74,39 @@ function App() {
   };
 
   const handleSubmit = async () => {
-    setLoading(true);
-    try {
-      for (const q of questions) {
-        const question = q.question;
-        const options = q.options || [];
-        const questionReward = ratings.questions[question] || 0;
-        const optionsReward = ratings.options[question] || 0;
+  setLoading(true);
+  try {
+    let ok = 0, ko = 0;
+    for (const q of questions) {
+      const question = q.question;
+      const options = q.options || [];
+      const questionReward = ratings.questions[question];
+      const optionsReward = ratings.options[question];
 
-        // Salva solo se almeno uno dei due voti è stato assegnato
-        if (ratings.questions[question] !== undefined || ratings.options[question] !== undefined) {
-          await saveTrainingData(formData, question, options, questionReward, optionsReward);
+      // Salva solo se almeno uno dei due è stato votato
+      if (questionReward !== undefined || optionsReward !== undefined) {
+        try {
+          await saveTrainingData(formData, question, options, questionReward ?? 0, optionsReward ?? 0);
+          ok++;
+        } catch {
+          ko++;
         }
       }
-      alert('Valutazioni inviate con successo!');
-      setQuestions([]); // Resetta le domande dopo l'invio
+    }
+    alert(`Valutazioni inviate.\nSuccessi: ${ok}\nErrori: ${ko}`);
+    if (ok > 0) {
+      setQuestions([]);
       setRatings({ questions: {}, options: {} });
       setAdditionalInputs({});
-    } catch (error) {
-      console.error('Errore nel salvare le valutazioni:', error);
-      alert('Errore durante l\'invio delle valutazioni.');
     }
+  // eslint-disable-next-line no-unused-vars
+  } catch (e) {
+    alert("Errore durante l'invio delle valutazioni.");
+  } finally {
     setLoading(false);
-  };
+  }
+};
+
 
   const isBrandFieldRequired = requiresBrandFields.includes(serviceMacroAreas[formData.service]);
 

@@ -22,12 +22,10 @@ const app = express();
 app.use(cors({
   origin: [
     "http://localhost:5173",
-    "https://rl-question-generator.vercel.app",
-    "https://basicadv.com",
-    "https://www.basicadv.com"
+    "https://rl-question-generator.vercel.app"
   ],
-  methods: ["GET","POST","PUT","DELETE","OPTIONS"],
-  allowedHeaders: ["Content-Type","Authorization"],
+  methods: ["GET", "POST", "PUT", "OPTIONS"],
+  allowedHeaders: ["Content-Type"]
 }));
 
 app.use(express.json());
@@ -128,7 +126,6 @@ app.post("/api/generate-questions", async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3001;
-app.get("/api/health", (_req, res) => res.json({ ok: true }));
-app.listen(PORT, "0.0.0.0", () => {
+app.listen(PORT, () => {
   console.log(`Server avviato su http://0.0.0.0:${PORT}`);
 });

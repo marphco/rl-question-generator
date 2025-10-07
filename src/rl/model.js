@@ -1,6 +1,15 @@
 import axios from 'axios';
 
-const API_URL = import.meta.env.VITE_API_BASE || '/api';
+function getApiBase() {
+  const raw = import.meta.env.VITE_API_BASE || "/api";
+  const base = raw.replace(/\/$/, "");
+  if (typeof window !== "undefined") {
+    console.log("[RL] API base:", base);
+  }
+  return base;
+}
+const API_URL = getApiBase();
+
 let trainingData = [];
 
 // Funzione per verificare se una domanda è ripetuta

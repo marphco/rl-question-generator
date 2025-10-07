@@ -5,11 +5,19 @@ import { evaluateQuestion } from "../rl/model";
 // 👉 Chiave rimossa: ora il frontend non contiene più segreti!
 //    Tutte le chiamate a OpenAI passeranno dal backend.
 
+function getApiBase() {
+  const raw = import.meta.env.VITE_API_BASE || "/api";
+  const base = raw.replace(/\/$/, ""); // niente slash finale
+  if (typeof window !== "undefined") {
+    console.log("[LLM] API base:", base);
+  }
+  return base;
+}
+
 async function callBackendLLM(prompt) {
-  // Legge la base URL dal file .env (VITE_API_BASE) o usa '/api' di default
-  const baseUrl = import.meta.env.VITE_API_BASE || '/api';
-  const response = await axios.post(`${baseUrl}/generate-questions`, { prompt });
-  return response.data.content; // il backend restituisce "content"
+  const baseUrl = getApiBase();
+  const { data } = await axios.post(`${baseUrl}/generate-questions`, { prompt });
+  return data.content;
 }
 
 async function generateRawQuestions({
