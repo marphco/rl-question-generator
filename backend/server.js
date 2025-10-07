@@ -13,7 +13,21 @@ const __dirname = path.dirname(__filename);
 dotenv.config({ path: path.join(__dirname, ".env") });
 
 const app = express();
-app.use(cors());
+
+const allowed = new Set([
+  "http://localhost:5173",
+  "https://rl-question-generator.vercel.app",
+]);
+
+app.use(cors({
+  origin: (origin, cb) => {
+    if (!origin || allowed.has(origin)) return cb(null, true);
+    return cb(new Error("CORS blocked"));
+  },
+  methods: ["GET","POST","PUT","DELETE","OPTIONS"],
+  allowedHeaders: ["Content-Type","Authorization"],
+}));
+
 app.use(express.json());
 
 // 🔎 fail-fast se manca la variabile
@@ -47,6 +61,8 @@ const trainingDataSchema = new mongoose.Schema(
 const TrainingData = mongoose.model("TrainingData", trainingDataSchema);
 
 // --- routes ---
+app.get("/api/health", (_req, res) => res.json({ ok: true }));
+
 app.post("/api/save-training-data", async (req, res) => {
   try {
     const data = new TrainingData(req.body);
@@ -80,10 +96,6 @@ app.get("/api/get-training-data", async (_req, res) => {
   }
 });
 
-app.listen(3001, () => {
-  console.log("Server avviato su http://0.0.0.0:3001");
-});
-
 // --- API LLM: il frontend chiama qui, la chiave resta solo nel server ---
 app.post("/api/generate-questions", async (req, res) => {
   try {
@@ -111,4 +123,9 @@ app.post("/api/generate-questions", async (req, res) => {
     console.error("LLM error:", err.response?.data || err.message);
     res.status(500).json({ error: "LLM request failed" });
   }
+});
+
+const PORT = process.env.PORT || 3001;
+app.listen(PORT, () => {
+  console.log(`Server avviato su http://0.0.0.0:${PORT}`);
 });
