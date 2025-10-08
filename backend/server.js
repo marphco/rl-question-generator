@@ -261,32 +261,58 @@ ${JSON.stringify(seedExamples, null, 2)}
       }
     };
 
-    const tooSimilar = (q, list) => {
-      const qn = normQ(q);
-      return list.some((b) => {
-        const bn = typeof b === "string" ? normQ(b) : b; // se in avoidList hai già norm
-        return qn.includes(bn) || bn.includes(qn);
-      });
+    const tooSimilar = (q, list, thr = 0.72) =>
+      list.some((b) => jaccard(q, b) >= thr);
+
+    let filteredByAsked = 0,
+      filteredByBlacklist = 0,
+      filteredByBatch = 0;
+
+    const arr0 = safeParse(content) || [];
+
+    // 2.1 filtra contro asked/blacklist (similitudini con storia)
+    const arr1 = arr0.filter((x) => {
+      if (!(x && typeof x.question === "string")) return false;
+      const q = x.question;
+
+      if (tooSimilar(q, Array.from(askedSet))) {
+        filteredByAsked++;
+        return false;
+      }
+      if (tooSimilar(q, avoidList)) {
+        filteredByBlacklist++;
+        return false;
+      }
+      return true;
+    });
+
+    // 2.2 dedup “intra-batch” (similitudini dentro lo stesso blocco)
+    const seen = [];
+    const arr2 = [];
+    for (const x of arr1) {
+      if (seen.some((prev) => jaccard(prev, x.question) >= 0.8)) {
+        filteredByBatch++;
+        continue;
+      }
+      seen.push(x.question);
+      arr2.push(x);
+    }
+
+    const finalArr = arr2.slice(0, n);
+    const meta = {
+      strategy: usedStrategy || "llm",
+      service: svc,
+      positives: positives.length,
+      negatives: negatives.length,
+      asked: askedSet.size,
+      filteredByAsked,
+      filteredByBlacklist,
+      filteredByBatch,
     };
 
-    const arr = (safeParse(content) || []).filter(
-      (x) =>
-        x &&
-        typeof x.question === "string" &&
-        !tooSimilar(x.question, Array.from(askedSet)) &&
-        !tooSimilar(x.question, avoidList)
-    );
-
-    const finalArr = arr.slice(0, n);
     return res.json({
-      content: JSON.stringify(finalArr.length ? finalArr : arr.slice(0, n)),
-      meta: {
-        strategy: exploited ? "exploit" : "llm",
-        service: svc,
-        positives: positives.length,
-        negatives: negatives.length,
-        asked: askedSet.size,
-      },
+      content: JSON.stringify(finalArr.length ? finalArr : arr1.slice(0, n)),
+      meta,
     });
   } catch (err) {
     console.error("LLM error:", err.response?.data || err.message);
@@ -305,9 +331,27 @@ app.get("/api/rl/stats", async (req, res) => {
     const norm = (s) =>
       String(s || "")
         .toLowerCase()
+        .normalize("NFKD")
+        .replace(/[^\p{L}\p{N}\s]/gu, " ")
         .replace(/\s+/g, " ")
-        .replace(/[?.!]+$/, "")
+        .replace(/[?.!,;:]+$/g, "")
         .trim();
+
+    const tokens = (s) =>
+      new Set(
+        norm(s)
+          .split(" ")
+          .filter((w) => w.length > 2)
+      ); // ignora parole corte
+
+    const jaccard = (a, b) => {
+      const A = tokens(a),
+        B = tokens(b);
+      let inter = 0;
+      for (const t of A) if (B.has(t)) inter++;
+      const union = A.size + B.size - inter;
+      return union ? inter / union : 0;
+    };
 
     // score = questionReward + optionsReward (+ piccolo bonus recency)
     const agg = new Map();
@@ -341,12 +385,19 @@ app.get("/api/rl/stats", async (req, res) => {
       .slice(0, 20)
       .reverse(); // più negativi in alto
 
-    res.json({
-      service: svc,
-      totalRatedPatterns: all.length,
-      topPos,
-      topNeg,
-    });
+    if (picked.length) {
+      const meta = {
+        strategy: "exploit",
+        service: svc,
+        positives: positives.length,
+        negatives: negatives.length,
+        asked: askedSet.size,
+        filteredByAsked: 0,
+        filteredByBlacklist: 0,
+        filteredByBatch: 0,
+      };
+      return res.json({ content: JSON.stringify(picked), meta });
+    }
   } catch (e) {
     res.status(500).json({ error: "stats_failed", details: e.message });
   }
