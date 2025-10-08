@@ -64,7 +64,14 @@ app.post("/api/save-training-data", async (req, res) => {
 
 app.put("/api/update-training-data", async (req, res) => {
   try {
-    const { state, question, options, questionReward, optionsReward, timestamp } = req.body;
+    const {
+      state,
+      question,
+      options,
+      questionReward,
+      optionsReward,
+      timestamp,
+    } = req.body;
     const updatedData = await TrainingData.findOneAndUpdate(
       { question, "state.service": state.service },
       { state, question, options, questionReward, optionsReward, timestamp },
@@ -158,10 +165,7 @@ app.post("/api/generate-questions", async (req, res) => {
       .sort((a, b) => a.score - b.score) // più negativo prima
       .slice(0, 30);
 
-    const avoidList = [
-      ...askedSet,
-      ...negatives.map((x) => x.qNorm),
-    ];
+    const avoidList = [...askedSet, ...negatives.map((x) => x.qNorm)];
 
     // helper: proietta example nel formato atteso dal tuo frontend
     const toExample = (x) => {
@@ -211,9 +215,7 @@ ${JSON.stringify(seedExamples, null, 2)}
 
     const llmPayload = {
       model: process.env.OPENAI_MODEL,
-      messages: [
-        { role: "user", content: `${prompt}\n\n${guardRails}` },
-      ],
+      messages: [{ role: "user", content: `${prompt}\n\n${guardRails}` }],
       max_tokens,
       temperature,
     };
@@ -229,10 +231,15 @@ ${JSON.stringify(seedExamples, null, 2)}
 
     // --- 3.4: parse sicuro e post-filtraggio (dedup + blacklist) ---
     const safeParse = (txt) => {
-      try { return JSON.parse(txt); } catch (_) {
-        const i = txt.indexOf("["); const j = txt.lastIndexOf("]");
+      try {
+        return JSON.parse(txt);
+      } catch (_) {
+        const i = txt.indexOf("[");
+        const j = txt.lastIndexOf("]");
         if (i !== -1 && j !== -1 && j > i) {
-          try { return JSON.parse(txt.slice(i, j + 1)); } catch (_) {}
+          try {
+            return JSON.parse(txt.slice(i, j + 1));
+          } catch (_) {}
         }
         return [];
       }
@@ -252,10 +259,18 @@ ${JSON.stringify(seedExamples, null, 2)}
     );
 
     const finalArr = arr.slice(0, n);
-    return res.json({ content: JSON.stringify(finalArr.length ? finalArr : arr.slice(0, n)) });
+    return res.json({
+      content: JSON.stringify(finalArr.length ? finalArr : arr.slice(0, n)),
+      meta: {
+        strategy: exploited ? "exploit" : "llm",
+        service: svc,
+        positives: positives.length,
+        negatives: negatives.length,
+        asked: askedSet.size,
+      },
+    });
   } catch (err) {
     console.error("LLM error:", err.response?.data || err.message);
     res.status(500).json({ error: "LLM request failed" });
   }
 });
-
