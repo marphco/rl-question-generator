@@ -99,6 +99,8 @@ app.listen(PORT, "0.0.0.0", () => {
 
 app.post("/api/generate-questions", async (req, res) => {
   try {
+    let exploited = false;
+
     const {
       prompt,
       state = {},
@@ -186,12 +188,22 @@ app.post("/api/generate-questions", async (req, res) => {
     // --- 3.2: piccola strategia ε-greedy (exploit diretto) ---
     const exploitP = parseFloat(process.env.RL_EXPLOIT_P || "0.35");
     if (seedExamples.length && Math.random() < exploitP) {
-      // prendi direttamente esempi top-rated che non sono stati già chiesti
       const picked = seedExamples
         .filter((e) => !askedSet.has(normQ(e.question)))
         .slice(0, n);
+
       if (picked.length) {
-        return res.json({ content: JSON.stringify(picked) });
+        exploited = true; // <— IMPORTANTE
+        return res.json({
+          content: JSON.stringify(picked),
+          meta: {
+            strategy: "exploit",
+            service: svc,
+            positives: positives.length,
+            negatives: negatives.length,
+            asked: askedSet.size,
+          },
+        });
       }
     }
 
@@ -283,36 +295,50 @@ app.get("/api/rl/stats", async (req, res) => {
       .limit(2000)
       .lean();
 
-    const norm = (s) => String(s||"").toLowerCase().replace(/\s+/g," ").replace(/[?.!]+$/,"").trim();
+    const norm = (s) =>
+      String(s || "")
+        .toLowerCase()
+        .replace(/\s+/g, " ")
+        .replace(/[?.!]+$/, "")
+        .trim();
 
     // score = questionReward + optionsReward (+ piccolo bonus recency)
     const agg = new Map();
     for (const r of rows) {
       const key = norm(r.question);
       const nowTs = r.timestamp ? new Date(r.timestamp).getTime() : 0;
-      const score = (Number.isFinite(r.questionReward) ? r.questionReward : 0)
-                  + (Number.isFinite(r.optionsReward) ? r.optionsReward : 0);
-      const prev = agg.get(key) || { question: r.question, options: r.options, score: 0, lastTs: 0, count: 0 };
+      const score =
+        (Number.isFinite(r.questionReward) ? r.questionReward : 0) +
+        (Number.isFinite(r.optionsReward) ? r.optionsReward : 0);
+      const prev = agg.get(key) || {
+        question: r.question,
+        options: r.options,
+        score: 0,
+        lastTs: 0,
+        count: 0,
+      };
       const recentBonus = nowTs && nowTs > prev.lastTs ? 0.0001 : 0; // trascurabile, solo tie-break
       agg.set(key, {
         ...prev,
         score: prev.score + score + recentBonus,
         lastTs: Math.max(prev.lastTs, nowTs),
-        count: prev.count + 1
+        count: prev.count + 1,
       });
     }
 
-    const all = Array.from(agg.values())
-      .sort((a,b) => b.score - a.score);
+    const all = Array.from(agg.values()).sort((a, b) => b.score - a.score);
 
-    const topPos = all.filter(x => x.score > 0).slice(0, 20);
-    const topNeg = all.filter(x => x.score < 0).slice(0, 20).reverse(); // più negativi in alto
+    const topPos = all.filter((x) => x.score > 0).slice(0, 20);
+    const topNeg = all
+      .filter((x) => x.score < 0)
+      .slice(0, 20)
+      .reverse(); // più negativi in alto
 
     res.json({
       service: svc,
       totalRatedPatterns: all.length,
       topPos,
-      topNeg
+      topNeg,
     });
   } catch (e) {
     res.status(500).json({ error: "stats_failed", details: e.message });
