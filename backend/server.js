@@ -126,8 +126,12 @@ app.post("/api/generate-questions", async (req, res) => {
     const normQ = (s) =>
       String(s || "")
         .toLowerCase()
-        .replace(/\s+/g, " ")
-        .replace(/[?.!]+$/g, "")
+        .normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, "") // togli accenti
+        .replace(/['"’]/g, "") // togli apostrofi/virgolette
+        // eslint-disable-next-line no-useless-escape
+        .replace(/[?.!,;:_\-]/g, " ") // punteggiatura -> spazio
+        .replace(/\s+/g, " ") // spazi multipli
         .trim();
 
     const scored = rows.map((r) => {
@@ -259,7 +263,10 @@ ${JSON.stringify(seedExamples, null, 2)}
 
     const tooSimilar = (q, list) => {
       const qn = normQ(q);
-      return list.some((b) => qn.includes(b) || b.includes(qn));
+      return list.some((b) => {
+        const bn = typeof b === "string" ? normQ(b) : b; // se in avoidList hai già norm
+        return qn.includes(bn) || bn.includes(qn);
+      });
     };
 
     const arr = (safeParse(content) || []).filter(
