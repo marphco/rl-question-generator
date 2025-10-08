@@ -274,3 +274,47 @@ ${JSON.stringify(seedExamples, null, 2)}
     res.status(500).json({ error: "LLM request failed" });
   }
 });
+
+app.get("/api/rl/stats", async (req, res) => {
+  try {
+    const svc = (req.query.service || "Logo").trim();
+    const rows = await TrainingData.find({ "state.service": svc })
+      .sort({ timestamp: -1 })
+      .limit(2000)
+      .lean();
+
+    const norm = (s) => String(s||"").toLowerCase().replace(/\s+/g," ").replace(/[?.!]+$/,"").trim();
+
+    // score = questionReward + optionsReward (+ piccolo bonus recency)
+    const agg = new Map();
+    for (const r of rows) {
+      const key = norm(r.question);
+      const nowTs = r.timestamp ? new Date(r.timestamp).getTime() : 0;
+      const score = (Number.isFinite(r.questionReward) ? r.questionReward : 0)
+                  + (Number.isFinite(r.optionsReward) ? r.optionsReward : 0);
+      const prev = agg.get(key) || { question: r.question, options: r.options, score: 0, lastTs: 0, count: 0 };
+      const recentBonus = nowTs && nowTs > prev.lastTs ? 0.0001 : 0; // trascurabile, solo tie-break
+      agg.set(key, {
+        ...prev,
+        score: prev.score + score + recentBonus,
+        lastTs: Math.max(prev.lastTs, nowTs),
+        count: prev.count + 1
+      });
+    }
+
+    const all = Array.from(agg.values())
+      .sort((a,b) => b.score - a.score);
+
+    const topPos = all.filter(x => x.score > 0).slice(0, 20);
+    const topNeg = all.filter(x => x.score < 0).slice(0, 20).reverse(); // più negativi in alto
+
+    res.json({
+      service: svc,
+      totalRatedPatterns: all.length,
+      topPos,
+      topNeg
+    });
+  } catch (e) {
+    res.status(500).json({ error: "stats_failed", details: e.message });
+  }
+});
