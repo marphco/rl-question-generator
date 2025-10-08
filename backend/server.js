@@ -1,5 +1,4 @@
 /* eslint-disable no-empty */
-/* eslint-disable no-unused-vars */
 /* eslint-disable no-undef */
 import express from "express";
 import mongoose from "mongoose";
@@ -97,9 +96,34 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`Server avviato su http://0.0.0.0:${PORT}`);
 });
 
+// ========= RL helpers: normalizzazione & similarità =========
+const norm = (s) =>
+  String(s || "")
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[^\p{L}\p{N}\s]/gu, " ") // rimuove segni diacritici e punteggiatura
+    .replace(/\s+/g, " ")
+    .replace(/[?.!,;:]+$/g, "")
+    .trim();
+
+const tokens = (s) => new Set(norm(s).split(" ").filter((w) => w.length > 2));
+
+const jaccard = (a, b) => {
+  const A = tokens(a),
+    B = tokens(b);
+  let inter = 0;
+  for (const t of A) if (B.has(t)) inter++;
+  const union = A.size + B.size - inter;
+  return union ? inter / union : 0;
+};
+
+const tooSimilar = (q, list, thr = 0.72) =>
+  list.some((b) => jaccard(q, b) >= thr);
+
+// ========= /api/generate-questions =========
 app.post("/api/generate-questions", async (req, res) => {
   try {
-    let exploited = false;
+    let exploited = false; // per meta.strategy
 
     const {
       prompt,
@@ -110,32 +134,22 @@ app.post("/api/generate-questions", async (req, res) => {
       temperature = 0.7,
     } = req.body;
 
-    // --- 3.1: leggi memoria (rating) per il servizio corrente ---
     const svc = (state?.service || "").trim() || "Logo";
-    const askedSet = new Set(
-      askedQuestions
-        .filter(Boolean)
-        .map((q) => q.toLowerCase().replace(/\s+/g, " ").trim())
-    );
 
+    // asked normalizzate
+    const askedList = (askedQuestions || []).filter(Boolean);
+    const askedNorm = askedList.map((q) => norm(q));
+    const askedSet = new Set(askedNorm);
+
+    // 1) Leggi memoria: ultimi pattern per servizio
     const rows = await TrainingData.find({ "state.service": svc })
       .sort({ timestamp: -1 })
       .limit(1000)
       .lean();
 
-    const normQ = (s) =>
-      String(s || "")
-        .toLowerCase()
-        .normalize("NFD")
-        .replace(/[\u0300-\u036f]/g, "") // togli accenti
-        .replace(/['"’]/g, "") // togli apostrofi/virgolette
-        // eslint-disable-next-line no-useless-escape
-        .replace(/[?.!,;:_\-]/g, " ") // punteggiatura -> spazio
-        .replace(/\s+/g, " ") // spazi multipli
-        .trim();
-
+    // Scoring di ciascun record
     const scored = rows.map((r) => {
-      const q = normQ(r.question);
+      const qNorm = norm(r.question);
       const score =
         (Number.isFinite(r.questionReward) ? r.questionReward : 0) +
         (Number.isFinite(r.optionsReward) ? r.optionsReward : 0);
@@ -144,15 +158,14 @@ app.post("/api/generate-questions", async (req, res) => {
         options: r.options,
         score,
         ts: r.timestamp ? new Date(r.timestamp).getTime() : 0,
-        qNorm: q,
+        qNorm,
       };
     });
 
-    // dedup per domanda, somma score (gli ultimi pesano di più)
+    // Aggregazione per domanda normalizzata (somma score + lieve bonus recency)
     const agg = new Map();
     for (const s of scored) {
       const prev = agg.get(s.qNorm) || { ...s, score: 0, ts: 0 };
-      // media pesata semplice: score + bonus recente
       const recentBonus = s.ts ? Math.max(0, (s.ts - prev.ts) / 1e13) : 0;
       prev.score = prev.score + s.score + recentBonus;
       prev.ts = Math.max(prev.ts, s.ts);
@@ -160,7 +173,6 @@ app.post("/api/generate-questions", async (req, res) => {
     }
     const uniq = Array.from(agg.values());
 
-    // top positivi e top negativi
     const positives = uniq
       .filter((x) => x.score > 0 && !askedSet.has(x.qNorm))
       .sort((a, b) => b.score - a.score)
@@ -168,12 +180,14 @@ app.post("/api/generate-questions", async (req, res) => {
 
     const negatives = uniq
       .filter((x) => x.score < 0)
-      .sort((a, b) => a.score - b.score) // più negativo prima
+      .sort((a, b) => a.score - b.score)
       .slice(0, 30);
 
-    const avoidList = [...askedSet, ...negatives.map((x) => x.qNorm)];
+    const avoidList = [
+      ...askedNorm, // già chieste nel flusso corrente
+      ...negatives.map((x) => x.qNorm), // pattern con feedback negativo
+    ];
 
-    // helper: proietta example nel formato atteso dal tuo frontend
     const toExample = (x) => {
       const opts = Array.isArray(x.options) ? x.options.slice(0, 4) : x.options;
       const requiresInput =
@@ -189,15 +203,15 @@ app.post("/api/generate-questions", async (req, res) => {
 
     const seedExamples = positives.slice(0, 6).map(toExample);
 
-    // --- 3.2: piccola strategia ε-greedy (exploit diretto) ---
+    // 2) ε-greedy: a volte sfrutta direttamente i top-rated
     const exploitP = parseFloat(process.env.RL_EXPLOIT_P || "0.35");
     if (seedExamples.length && Math.random() < exploitP) {
       const picked = seedExamples
-        .filter((e) => !askedSet.has(normQ(e.question)))
+        .filter((e) => !askedSet.has(norm(e.question)))
         .slice(0, n);
 
       if (picked.length) {
-        exploited = true; // <— IMPORTANTE
+        exploited = true;
         return res.json({
           content: JSON.stringify(picked),
           meta: {
@@ -206,12 +220,15 @@ app.post("/api/generate-questions", async (req, res) => {
             positives: positives.length,
             negatives: negatives.length,
             asked: askedSet.size,
+            filteredByAsked: 0,
+            filteredByBlacklist: 0,
+            filteredByBatch: 0,
           },
         });
       }
     }
 
-    // --- 3.3: prompt con bias: esempi "buoni" + blacklist "cattive" ---
+    // 3) Prompt con guard-rails: esempi positivi + blacklist negative
     const guardRails = `
 Sei un assistente che propone domande pertinenti per il servizio: "${svc}".
 
@@ -229,53 +246,50 @@ ${JSON.stringify(seedExamples, null, 2)}
 - Non includere testo fuori dal JSON, né commenti, né markdown.
 `;
 
-    const llmPayload = {
+    const payload = {
       model: process.env.OPENAI_MODEL,
       messages: [{ role: "user", content: `${prompt}\n\n${guardRails}` }],
       max_tokens,
       temperature,
     };
 
-    const response = await axios.post(process.env.OPENAI_API_URL, llmPayload, {
+    const llm = await axios.post(process.env.OPENAI_API_URL, payload, {
       headers: {
         Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
         "Content-Type": "application/json",
       },
     });
 
-    let content = response.data?.choices?.[0]?.message?.content ?? "[]";
+    const rawContent = llm.data?.choices?.[0]?.message?.content ?? "[]";
 
-    // --- 3.4: parse sicuro e post-filtraggio (dedup + blacklist) ---
     const safeParse = (txt) => {
       try {
         return JSON.parse(txt);
-      } catch (_) {
+      } catch {
         const i = txt.indexOf("[");
         const j = txt.lastIndexOf("]");
         if (i !== -1 && j !== -1 && j > i) {
           try {
             return JSON.parse(txt.slice(i, j + 1));
-          } catch (_) {}
+          } catch {}
         }
         return [];
       }
     };
 
-    const tooSimilar = (q, list, thr = 0.72) =>
-      list.some((b) => jaccard(q, b) >= thr);
-
+    // 4) Post-filtri: asked/blacklist + dedup intra-batch + fissaggi formato
     let filteredByAsked = 0,
       filteredByBlacklist = 0,
       filteredByBatch = 0;
 
-    const arr0 = safeParse(content) || [];
+    const arr0 = safeParse(rawContent) || [];
 
-    // 2.1 filtra contro asked/blacklist (similitudini con storia)
+    // 4.1: filtra contro storia e blacklist (similarità)
     const arr1 = arr0.filter((x) => {
       if (!(x && typeof x.question === "string")) return false;
       const q = x.question;
 
-      if (tooSimilar(q, Array.from(askedSet))) {
+      if (tooSimilar(q, askedNorm)) {
         filteredByAsked++;
         return false;
       }
@@ -286,21 +300,42 @@ ${JSON.stringify(seedExamples, null, 2)}
       return true;
     });
 
-    // 2.2 dedup “intra-batch” (similitudini dentro lo stesso blocco)
+    // 4.2: dedup intra-batch (tra le domande appena proposte)
     const seen = [];
     const arr2 = [];
     for (const x of arr1) {
-      if (seen.some((prev) => jaccard(prev, x.question) >= 0.8)) {
+      const qn = norm(x.question);
+      if (seen.some((prev) => jaccard(prev, qn) >= 0.8)) {
         filteredByBatch++;
         continue;
       }
-      seen.push(x.question);
+      seen.push(qn);
       arr2.push(x);
     }
 
-    const finalArr = arr2.slice(0, n);
+    // 4.3: enforcement del formato (options/ requiresInput)
+    const fixFormat = (x) => {
+      const out = { ...x };
+      const req = !!out.requiresInput;
+      if (req) {
+        out.options = [];
+      } else {
+        let opts = Array.isArray(out.options) ? out.options : [];
+        // se non sono 4, sistemale (taglia o riempi con placeholder neutri)
+        if (opts.length > 4) opts = opts.slice(0, 4);
+        if (opts.length < 4) {
+          while (opts.length < 4) opts.push(`Opzione ${opts.length + 1}`);
+        }
+        out.options = opts;
+      }
+      out.type = typeof out.type === "string" ? out.type : "multiple";
+      return out;
+    };
+
+    const finalArr = arr2.slice(0, n).map(fixFormat);
+
     const meta = {
-      strategy: usedStrategy || "llm",
+      strategy: exploited ? "exploit" : "llm",
       service: svc,
       positives: positives.length,
       negatives: negatives.length,
@@ -311,15 +346,16 @@ ${JSON.stringify(seedExamples, null, 2)}
     };
 
     return res.json({
-      content: JSON.stringify(finalArr.length ? finalArr : arr1.slice(0, n)),
+      content: JSON.stringify(finalArr.length ? finalArr : arr1.slice(0, n).map(fixFormat)),
       meta,
     });
   } catch (err) {
-    console.error("LLM error:", err.response?.data || err.message);
-    res.status(500).json({ error: "LLM request failed" });
+    console.error("GENQ error:", err?.response?.data || err);
+    res.status(500).json({ error: "LLM request failed", details: err?.message });
   }
 });
 
+// ========= /api/rl/stats =========
 app.get("/api/rl/stats", async (req, res) => {
   try {
     const svc = (req.query.service || "Logo").trim();
@@ -328,32 +364,7 @@ app.get("/api/rl/stats", async (req, res) => {
       .limit(2000)
       .lean();
 
-    const norm = (s) =>
-      String(s || "")
-        .toLowerCase()
-        .normalize("NFKD")
-        .replace(/[^\p{L}\p{N}\s]/gu, " ")
-        .replace(/\s+/g, " ")
-        .replace(/[?.!,;:]+$/g, "")
-        .trim();
-
-    const tokens = (s) =>
-      new Set(
-        norm(s)
-          .split(" ")
-          .filter((w) => w.length > 2)
-      ); // ignora parole corte
-
-    const jaccard = (a, b) => {
-      const A = tokens(a),
-        B = tokens(b);
-      let inter = 0;
-      for (const t of A) if (B.has(t)) inter++;
-      const union = A.size + B.size - inter;
-      return union ? inter / union : 0;
-    };
-
-    // score = questionReward + optionsReward (+ piccolo bonus recency)
+    // aggrega per domanda normalizzata
     const agg = new Map();
     for (const r of rows) {
       const key = norm(r.question);
@@ -361,6 +372,7 @@ app.get("/api/rl/stats", async (req, res) => {
       const score =
         (Number.isFinite(r.questionReward) ? r.questionReward : 0) +
         (Number.isFinite(r.optionsReward) ? r.optionsReward : 0);
+
       const prev = agg.get(key) || {
         question: r.question,
         options: r.options,
@@ -368,7 +380,7 @@ app.get("/api/rl/stats", async (req, res) => {
         lastTs: 0,
         count: 0,
       };
-      const recentBonus = nowTs && nowTs > prev.lastTs ? 0.0001 : 0; // trascurabile, solo tie-break
+      const recentBonus = nowTs && nowTs > prev.lastTs ? 0.0001 : 0; // tie-break minimo
       agg.set(key, {
         ...prev,
         score: prev.score + score + recentBonus,
@@ -378,27 +390,17 @@ app.get("/api/rl/stats", async (req, res) => {
     }
 
     const all = Array.from(agg.values()).sort((a, b) => b.score - a.score);
-
     const topPos = all.filter((x) => x.score > 0).slice(0, 20);
-    const topNeg = all
-      .filter((x) => x.score < 0)
-      .slice(0, 20)
-      .reverse(); // più negativi in alto
+    const topNeg = all.filter((x) => x.score < 0).slice(0, 20).reverse();
 
-    if (picked.length) {
-      const meta = {
-        strategy: "exploit",
-        service: svc,
-        positives: positives.length,
-        negatives: negatives.length,
-        asked: askedSet.size,
-        filteredByAsked: 0,
-        filteredByBlacklist: 0,
-        filteredByBatch: 0,
-      };
-      return res.json({ content: JSON.stringify(picked), meta });
-    }
+    return res.json({
+      service: svc,
+      totalRatedPatterns: agg.size,
+      topPos,
+      topNeg,
+    });
   } catch (e) {
+    console.error("STATS error:", e);
     res.status(500).json({ error: "stats_failed", details: e.message });
   }
 });
