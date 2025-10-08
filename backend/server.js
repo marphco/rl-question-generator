@@ -80,8 +80,9 @@ app.get("/api/get-training-data", async (_req, res) => {
   }
 });
 
-app.listen(3001, () => {
-  console.log("Server avviato su http://0.0.0.0:3001");
+const PORT = process.env.PORT || 3001;
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Server avviato su http://0.0.0.0:${PORT}`);
 });
 
 // --- API LLM: il frontend chiama qui, la chiave resta solo nel server ---
