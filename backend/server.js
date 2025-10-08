@@ -1,3 +1,5 @@
+/* eslint-disable no-empty */
+/* eslint-disable no-unused-vars */
 /* eslint-disable no-undef */
 import express from "express";
 import mongoose from "mongoose";
@@ -44,6 +46,9 @@ const trainingDataSchema = new mongoose.Schema(
   { collection: "appuser" }
 );
 
+trainingDataSchema.index({ "state.service": 1, timestamp: -1 });
+trainingDataSchema.index({ "state.service": 1, question: 1 });
+
 const TrainingData = mongoose.model("TrainingData", trainingDataSchema);
 
 // --- routes ---
@@ -85,31 +90,172 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`Server avviato su http://0.0.0.0:${PORT}`);
 });
 
-// --- API LLM: il frontend chiama qui, la chiave resta solo nel server ---
 app.post("/api/generate-questions", async (req, res) => {
   try {
-    const { prompt, max_tokens = 2000, temperature = 0.7 } = req.body;
+    const {
+      prompt,
+      state = {},
+      askedQuestions = [],
+      n = 6,
+      max_tokens = 600,
+      temperature = 0.7,
+    } = req.body;
 
-    const response = await axios.post(
-      process.env.OPENAI_API_URL,
-      {
-        model: process.env.OPENAI_MODEL,
-        messages: [{ role: "user", content: prompt }],
-        max_tokens,
-        temperature,
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-      }
+    // --- 3.1: leggi memoria (rating) per il servizio corrente ---
+    const svc = (state?.service || "").trim() || "Logo";
+    const askedSet = new Set(
+      askedQuestions
+        .filter(Boolean)
+        .map((q) => q.toLowerCase().replace(/\s+/g, " ").trim())
     );
 
-    const content = response.data?.choices?.[0]?.message?.content ?? "[]";
-    res.json({ content });
+    const rows = await TrainingData.find({ "state.service": svc })
+      .sort({ timestamp: -1 })
+      .limit(1000)
+      .lean();
+
+    const normQ = (s) =>
+      String(s || "")
+        .toLowerCase()
+        .replace(/\s+/g, " ")
+        .replace(/[?.!]+$/g, "")
+        .trim();
+
+    const scored = rows.map((r) => {
+      const q = normQ(r.question);
+      const score =
+        (Number.isFinite(r.questionReward) ? r.questionReward : 0) +
+        (Number.isFinite(r.optionsReward) ? r.optionsReward : 0);
+      return {
+        question: r.question,
+        options: r.options,
+        score,
+        ts: r.timestamp ? new Date(r.timestamp).getTime() : 0,
+        qNorm: q,
+      };
+    });
+
+    // dedup per domanda, somma score (gli ultimi pesano di più)
+    const agg = new Map();
+    for (const s of scored) {
+      const prev = agg.get(s.qNorm) || { ...s, score: 0, ts: 0 };
+      // media pesata semplice: score + bonus recente
+      const recentBonus = s.ts ? Math.max(0, (s.ts - prev.ts) / 1e13) : 0;
+      prev.score = prev.score + s.score + recentBonus;
+      prev.ts = Math.max(prev.ts, s.ts);
+      agg.set(s.qNorm, prev);
+    }
+    const uniq = Array.from(agg.values());
+
+    // top positivi e top negativi
+    const positives = uniq
+      .filter((x) => x.score > 0 && !askedSet.has(x.qNorm))
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 20);
+
+    const negatives = uniq
+      .filter((x) => x.score < 0)
+      .sort((a, b) => a.score - b.score) // più negativo prima
+      .slice(0, 30);
+
+    const avoidList = [
+      ...askedSet,
+      ...negatives.map((x) => x.qNorm),
+    ];
+
+    // helper: proietta example nel formato atteso dal tuo frontend
+    const toExample = (x) => {
+      const opts = Array.isArray(x.options) ? x.options.slice(0, 4) : x.options;
+      const requiresInput =
+        (typeof x.options === "string" && x.options === "text-area") ||
+        (Array.isArray(x.options) && x.options.length === 0);
+      return {
+        question: x.question,
+        options: requiresInput ? [] : Array.isArray(opts) ? opts : [],
+        type: "multiple",
+        requiresInput,
+      };
+    };
+
+    const seedExamples = positives.slice(0, 6).map(toExample);
+
+    // --- 3.2: piccola strategia ε-greedy (exploit diretto) ---
+    const exploitP = parseFloat(process.env.RL_EXPLOIT_P || "0.35");
+    if (seedExamples.length && Math.random() < exploitP) {
+      // prendi direttamente esempi top-rated che non sono stati già chiesti
+      const picked = seedExamples
+        .filter((e) => !askedSet.has(normQ(e.question)))
+        .slice(0, n);
+      if (picked.length) {
+        return res.json({ content: JSON.stringify(picked) });
+      }
+    }
+
+    // --- 3.3: prompt con bias: esempi "buoni" + blacklist "cattive" ---
+    const guardRails = `
+Sei un assistente che propone domande pertinenti per il servizio: "${svc}".
+
+1) Evita di ripetere/parafrasare queste domande (blacklist):
+${JSON.stringify(avoidList.slice(0, 50), null, 2)}
+
+2) Prendi come qualità/tono questi esempi valutati bene dagli utenti:
+${JSON.stringify(seedExamples, null, 2)}
+
+3) Regole di output:
+- Restituisci ESCLUSIVAMENTE un array JSON di ${n} oggetti.
+- Ogni oggetto ha: "question" (string), "options" (array di 0..4 stringhe), "type" (string), "requiresInput" (boolean).
+- Se "requiresInput" è true ⇒ "options" deve essere [].
+- Se "requiresInput" è false ⇒ "options" deve avere esattamente 4 voci concise e distinte.
+- Non includere testo fuori dal JSON, né commenti, né markdown.
+`;
+
+    const llmPayload = {
+      model: process.env.OPENAI_MODEL,
+      messages: [
+        { role: "user", content: `${prompt}\n\n${guardRails}` },
+      ],
+      max_tokens,
+      temperature,
+    };
+
+    const response = await axios.post(process.env.OPENAI_API_URL, llmPayload, {
+      headers: {
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+    });
+
+    let content = response.data?.choices?.[0]?.message?.content ?? "[]";
+
+    // --- 3.4: parse sicuro e post-filtraggio (dedup + blacklist) ---
+    const safeParse = (txt) => {
+      try { return JSON.parse(txt); } catch (_) {
+        const i = txt.indexOf("["); const j = txt.lastIndexOf("]");
+        if (i !== -1 && j !== -1 && j > i) {
+          try { return JSON.parse(txt.slice(i, j + 1)); } catch (_) {}
+        }
+        return [];
+      }
+    };
+
+    const tooSimilar = (q, list) => {
+      const qn = normQ(q);
+      return list.some((b) => qn.includes(b) || b.includes(qn));
+    };
+
+    const arr = (safeParse(content) || []).filter(
+      (x) =>
+        x &&
+        typeof x.question === "string" &&
+        !tooSimilar(x.question, Array.from(askedSet)) &&
+        !tooSimilar(x.question, avoidList)
+    );
+
+    const finalArr = arr.slice(0, n);
+    return res.json({ content: JSON.stringify(finalArr.length ? finalArr : arr.slice(0, n)) });
   } catch (err) {
     console.error("LLM error:", err.response?.data || err.message);
     res.status(500).json({ error: "LLM request failed" });
   }
 });
+
