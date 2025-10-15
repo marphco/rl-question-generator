@@ -45,15 +45,27 @@ const trainingDataSchema = new mongoose.Schema(
   { collection: "appuser" }
 );
 
-trainingDataSchema.index({ "state.service": 1, timestamp: -1 });
-trainingDataSchema.index({ "state.service": 1, question: 1 });
+trainingDataSchema.index({
+  "state.service": 1,
+  "state.language": 1,
+  timestamp: -1,
+});
+trainingDataSchema.index({
+  "state.service": 1,
+  "state.language": 1,
+  question: 1,
+});
 
 const TrainingData = mongoose.model("TrainingData", trainingDataSchema);
 
 // --- routes ---
 app.post("/api/save-training-data", async (req, res) => {
   try {
-    const data = new TrainingData(req.body);
+    const { state = {}, language } = req.body;
+    const lang = (state && state.language) || language || "it";
+    const next = { ...req.body, state: { ...state, language: lang } };
+
+    const data = new TrainingData(next);
     await data.save();
     res.status(200).json({ message: "Dati salvati", data });
   } catch (error) {
@@ -64,18 +76,35 @@ app.post("/api/save-training-data", async (req, res) => {
 app.put("/api/update-training-data", async (req, res) => {
   try {
     const {
-      state,
+      state = {},
       question,
       options,
       questionReward,
       optionsReward,
       timestamp,
+      language, // opzionale: se arriva fuori da state, lo usiamo comunque
     } = req.body;
+
+    const lang = (state && state.language) || language || "it";
+    const nextState = { ...state, language: lang };
+
     const updatedData = await TrainingData.findOneAndUpdate(
-      { question, "state.service": state.service },
-      { state, question, options, questionReward, optionsReward, timestamp },
+      {
+        question,
+        "state.service": nextState.service,
+        "state.language": lang, // <-- chiave di partizione lingua
+      },
+      {
+        state: nextState,
+        question,
+        options,
+        questionReward,
+        optionsReward,
+        timestamp,
+      },
       { upsert: true, new: true }
     );
+
     res.status(200).json({ message: "Dati aggiornati", data: updatedData });
   } catch (error) {
     res.status(500).json({ message: "Errore aggiornamento", error });
@@ -106,7 +135,12 @@ const norm = (s) =>
     .replace(/[?.!,;:]+$/g, "")
     .trim();
 
-const tokens = (s) => new Set(norm(s).split(" ").filter((w) => w.length > 2));
+const tokens = (s) =>
+  new Set(
+    norm(s)
+      .split(" ")
+      .filter((w) => w.length > 2)
+  );
 
 const jaccard = (a, b) => {
   const A = tokens(a),
@@ -132,9 +166,11 @@ app.post("/api/generate-questions", async (req, res) => {
       n = 6,
       max_tokens = 600,
       temperature = 0.7,
+      language = "it",
     } = req.body;
 
-    const svc = (state?.service || "").trim() || "Logo";
+    const svc = (state?.service || "").trim() || "Logo"; // NEW: usata per query e meta
+    const langName = language === "en" ? "English" : "Italian";
 
     // asked normalizzate
     const askedList = (askedQuestions || []).filter(Boolean);
@@ -142,7 +178,20 @@ app.post("/api/generate-questions", async (req, res) => {
     const askedSet = new Set(askedNorm);
 
     // 1) Leggi memoria: ultimi pattern per servizio
-    const rows = await TrainingData.find({ "state.service": svc })
+    const langFilter =
+      language === "it"
+        ? {
+            $or: [
+              { "state.language": { $exists: false } },
+              { "state.language": "it" },
+            ],
+          } // IT include legacy
+        : { "state.language": language }; // EN (o altre) solo quella lingua
+
+    const rows = await TrainingData.find({
+      "state.service": svc,
+      ...langFilter,
+    })
       .sort({ timestamp: -1 })
       .limit(1000)
       .lean();
@@ -205,12 +254,23 @@ app.post("/api/generate-questions", async (req, res) => {
 
     // 2) ε-greedy: a volte sfrutta direttamente i top-rated
     const exploitP = parseFloat(process.env.RL_EXPLOIT_P || "0.35");
-    if (seedExamples.length && Math.random() < exploitP) {
+
+    // Abilita exploit:
+    // - in IT sempre (back-compat), e
+    // - in altre lingue SOLO se abbiamo abbastanza esempi per questa lingua (>= n).
+    const hasEnoughLangSeeds = seedExamples.length >= n;
+    const allowExploit = language === "it" ? true : hasEnoughLangSeeds;
+
+    console.log(
+      `[GENQ] allowExploit=${allowExploit} lang=${language} seeds=${seedExamples.length} n=${n}`
+    );
+
+    if (allowExploit && Math.random() < exploitP) {
       const picked = seedExamples
         .filter((e) => !askedSet.has(norm(e.question)))
         .slice(0, n);
 
-      if (picked.length) {
+      if (picked.length === n) {
         exploited = true;
         return res.json({
           content: JSON.stringify(picked),
@@ -229,26 +289,54 @@ app.post("/api/generate-questions", async (req, res) => {
     }
 
     // 3) Prompt con guard-rails: esempi positivi + blacklist negative
-    const guardRails = `
-Sei un assistente che propone domande pertinenti per il servizio: "${svc}".
+    const guardRails =
+      language === "en"
+        ? `
+You are an assistant that proposes precise, useful intake questions for the service: "${svc}".
 
-1) Evita di ripetere/parafrasare queste domande (blacklist):
+IMPORTANT: Write ALL question texts, option labels, and any other strings in English.
+
+Blacklist (avoid repeating or paraphrasing these questions):
 ${JSON.stringify(avoidList.slice(0, 50), null, 2)}
 
-2) Prendi come qualità/tono questi esempi valutati bene dagli utenti:
+Positive examples (style/quality reference only; do NOT copy them verbatim):
 ${JSON.stringify(seedExamples, null, 2)}
 
-3) Regole di output:
-- Restituisci ESCLUSIVAMENTE un array JSON di ${n} oggetti.
-- Ogni oggetto ha: "question" (string), "options" (array di 0..4 stringhe), "type" (string), "requiresInput" (boolean).
-- Se "requiresInput" è true ⇒ "options" deve essere [].
-- Se "requiresInput" è false ⇒ "options" deve avere esattamente 4 voci concise e distinte.
-- Non includere testo fuori dal JSON, né commenti, né markdown.
-`;
+Output rules:
+- Return ONLY a JSON array with EXACTLY ${n} objects.
+- Each object has: "question" (string), "options" (array with 0..4 strings), "type" (string), "requiresInput" (boolean).
+- If "requiresInput" is true ⇒ "options": [].
+- If "requiresInput" is false ⇒ "options" MUST have exactly 4 short, distinct options.
+- No prose, no markdown, no comments, no code fences. JSON array ONLY.
+`.trim()
+        : `
+Sei un assistente che propone domande pertinenti e utili per il servizio: "${svc}".
+
+IMPORTANTE: Scrivi TUTTE le domande, le opzioni e le etichette in Italiano.
+
+Blacklist (evita di ripetere/parafrasare queste domande):
+${JSON.stringify(avoidList.slice(0, 50), null, 2)}
+
+Esempi positivi (solo come riferimento di stile/qualità; NON copiarli alla lettera):
+${JSON.stringify(seedExamples, null, 2)}
+
+Regole di output:
+- Restituisci SOLO un array JSON con ESATTAMENTE ${n} oggetti.
+- Ogni oggetto ha: "question" (string), "options" (array con 0..4 stringhe), "type" (string), "requiresInput" (boolean).
+- Se "requiresInput" è true ⇒ "options": [].
+- Se "requiresInput" è false ⇒ "options" DEVE avere esattamente 4 opzioni concise e distinte.
+- Niente testo fuori dal JSON, niente markdown, niente commenti. SOLO l'array JSON.
+`.trim();
 
     const payload = {
       model: process.env.OPENAI_MODEL,
-      messages: [{ role: "user", content: `${prompt}\n\n${guardRails}` }],
+      messages: [
+        {
+          role: "system",
+          content: `You are a question generator. Reply with JSON ONLY. Do not include prose or code fences. Use ${langName} for every string.`,
+        },
+        { role: "user", content: `${prompt}\n\n${guardRails}` },
+      ],
       max_tokens,
       temperature,
     };
@@ -261,6 +349,12 @@ ${JSON.stringify(seedExamples, null, 2)}
     });
 
     const rawContent = llm.data?.choices?.[0]?.message?.content ?? "[]";
+
+    // LOG DIAGNOSTICO (breve, sicuro in prod):
+    if (process.env.NODE_ENV !== "production") {
+      const preview = String(rawContent).slice(0, 200).replace(/\s+/g, " ");
+      console.log(`[GENQ][raw preview] ${preview}`);
+    }
 
     const safeParse = (txt) => {
       try {
@@ -324,7 +418,9 @@ ${JSON.stringify(seedExamples, null, 2)}
         // se non sono 4, sistemale (taglia o riempi con placeholder neutri)
         if (opts.length > 4) opts = opts.slice(0, 4);
         if (opts.length < 4) {
-          while (opts.length < 4) opts.push(`Opzione ${opts.length + 1}`);
+          const placeholder = language === "en" ? "Option" : "Opzione";
+          while (opts.length < 4)
+            opts.push(`${placeholder} ${opts.length + 1}`);
         }
         out.options = opts;
       }
@@ -346,12 +442,16 @@ ${JSON.stringify(seedExamples, null, 2)}
     };
 
     return res.json({
-      content: JSON.stringify(finalArr.length ? finalArr : arr1.slice(0, n).map(fixFormat)),
+      content: JSON.stringify(
+        finalArr.length ? finalArr : arr1.slice(0, n).map(fixFormat)
+      ),
       meta,
     });
   } catch (err) {
     console.error("GENQ error:", err?.response?.data || err);
-    res.status(500).json({ error: "LLM request failed", details: err?.message });
+    res
+      .status(500)
+      .json({ error: "LLM request failed", details: err?.message });
   }
 });
 
@@ -359,7 +459,21 @@ ${JSON.stringify(seedExamples, null, 2)}
 app.get("/api/rl/stats", async (req, res) => {
   try {
     const svc = (req.query.service || "Logo").trim();
-    const rows = await TrainingData.find({ "state.service": svc })
+    const language = (req.query.language || "").trim();
+
+    const langFilter = language
+      ? { "state.language": language }
+      : {
+          $or: [
+            { "state.language": { $exists: false } },
+            { "state.language": "it" },
+          ],
+        }; // default IT + legacy
+
+    const rows = await TrainingData.find({
+      "state.service": svc,
+      ...langFilter,
+    })
       .sort({ timestamp: -1 })
       .limit(2000)
       .lean();
@@ -391,7 +505,10 @@ app.get("/api/rl/stats", async (req, res) => {
 
     const all = Array.from(agg.values()).sort((a, b) => b.score - a.score);
     const topPos = all.filter((x) => x.score > 0).slice(0, 20);
-    const topNeg = all.filter((x) => x.score < 0).slice(0, 20).reverse();
+    const topNeg = all
+      .filter((x) => x.score < 0)
+      .slice(0, 20)
+      .reverse();
 
     return res.json({
       service: svc,
